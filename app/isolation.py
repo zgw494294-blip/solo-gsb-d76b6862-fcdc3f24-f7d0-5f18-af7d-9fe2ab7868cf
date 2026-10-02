@@ -14,12 +14,16 @@
   * 连通区内用水节点按当前需水量（含已提交的修订）求解，且任何用水节点水头
     不得低于最低限值；
   * 失供节点也保存新需水量并计入失供总量，重新连通后自动按新值参与求解；
+  * 失供需水量之和等任何聚合值都不得溢出为非有限数，候选快照内的每个数值也
+    都必须可严格 JSON 编码（允许把单个节点改为 1e308 这样的有限大值，但多个
+    大值相加溢出时按规则失败）；
   * 连通区仅剩水源时供水量为零（不再调用求解器）。
 
 只有全部规则满足且稳态求解收敛时才一次性提交：切换提交关闭集合、修订提交
-需水量，二者都提交完整快照并把版本号 +1；非法操作、不收敛或规则不满足时
-全部保持原状并说明原因。版本号即乐观锁：同一版本的修订与管段切换合计最多
-成功一次；读取始终返回某一版本的完整快照，绝不混合不同版本的数据。
+需水量，二者都提交完整快照并把版本号 +1；非法操作、聚合溢出、快照含非有限
+数、不收敛或规则不满足时全部保持原状并说明原因。版本号即乐观锁：同一版本的
+修订与管段切换合计最多成功一次；读取始终返回某一版本的完整快照，绝不混合
+不同版本的数据。
 
 耗时的连通区重算与稳态求解在作业锁之外进行，因此计算期间健康检查、已提交
 快照的读取以及其他作业的操作都不会被阻塞；同一作业也允许后来的切换先算完
@@ -36,6 +40,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from collections import deque
@@ -236,6 +241,29 @@ def _source_only_solution(net: Network, source: dict[str, Any]) -> dict[str, Any
     }
 
 
+def _find_non_finite_path(value: Any, prefix: str = "") -> str | None:
+    """深度优先返回快照中首个非有限 float 的点分路径（供错误说明引用）。
+
+    只拒绝 Python float（含 numpy 浮点，它是 float 的子类）；布尔值虽为 int
+    子类但不是 float，不受影响。找不到非有限值时返回 None。
+    """
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return prefix or "<root>"
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            path = _find_non_finite_path(item, f"{prefix}.{key}" if prefix else str(key))
+            if path is not None:
+                return path
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            path = _find_non_finite_path(item, f"{prefix}[{index}]" if prefix else f"[{index}]")
+            if path is not None:
+                return path
+    return None
+
+
 def _build_snapshot(job_id: str, version: int, net: Network,
                     allowed: frozenset[str], closed: frozenset[str],
                     *, stage: str) -> dict[str, Any]:
@@ -268,6 +296,30 @@ def _build_snapshot(job_id: str, version: int, net: Network,
         raise IsolationRuleError(
             f"{action}后用水节点 {names} 将失供，但其不在允许暂时失供的节点集合内；"
             "本次操作未生效，关闭集合、版本与稳态结果全部保持原状。")
+
+    # 规则 1b：失供需水量之和等聚合值不得溢出为非有限数。单个节点允许取
+    # 1e308 这样的有限大值（不设任何人为上限），但多个大值相加溢出为 inf 时，
+    # 快照无法严格 JSON 编码，必须在提交前按规则失败，绝不留下不可编码的快照。
+    unserved_total = float(sum(demand_map[nid] for nid in unserved))
+    if not math.isfinite(unserved_total):
+        names = "、".join(f"“{nid}”" for nid in unserved)
+        if stage == "create":
+            raise IsolationRuleError(
+                f"初始状态下失供节点（{names}）的失供需水量之和溢出为非有限值，"
+                "超出浮点可表示范围，不创建停管隔离作业；请避免使用会导致聚合"
+                "溢出的过大需水量（单个有限大值允许，聚合不得溢出）。")
+        if stage == "revise":
+            raise IsolationRuleError(
+                f"修订需水量后，失供节点（{names}）保存的新需水量之和"
+                f"（失供总量）溢出为非有限值（{unserved_total!r}），超出浮点"
+                "可表示范围，候选快照无法以严格 JSON 编码；本次修订未生效，"
+                "需水量、关闭集合、快照与版本号全部保持原状。请把相关失供节点"
+                "的需水量改小后用同一版本重试（单个 1e308 这样的有限大值仍然"
+                "允许，只要聚合不溢出；不得用上限、字符串、null 或截断掩盖溢出）。")
+        raise IsolationRuleError(
+            f"切换后失供节点（{names}）的当前需水量之和（失供总量）溢出为非有限值"
+            f"（{unserved_total!r}），超出浮点可表示范围，候选快照无法以严格 JSON "
+            "编码；本次操作未生效，关闭集合、需水量、快照与版本号全部保持原状。")
 
     # 规则 2：连通区用水节点按当前需水量求解且不得欠压；仅剩水源时供水量为零
     if len(component_nodes) == 1:
@@ -310,7 +362,7 @@ def _build_snapshot(job_id: str, version: int, net: Network,
                 f"切换后连通区内用水节点 {names} 的水头将低于最低水头限值 "
                 f"{net.min_head:g}；本次操作未生效，关闭集合、版本与稳态结果全部保持原状。")
 
-    return {
+    snapshot = {
         "job_id": job_id,
         "version": version,
         "min_head": net.min_head,
@@ -327,7 +379,7 @@ def _build_snapshot(job_id: str, version: int, net: Network,
             for p in net.pipes
         ],
         "unserved_nodes": unserved,
-        "unserved_demand": float(sum(demand_map[nid] for nid in unserved)),
+        "unserved_demand": unserved_total,
         "component_nodes": component_nodes,
         "component_pipes": [p["id"] for p in component_pipes],
         "source_only": len(component_nodes) == 1,
@@ -335,6 +387,29 @@ def _build_snapshot(job_id: str, version: int, net: Network,
         "total_demand": solution["total_demand"],
         "solution": solution,
     }
+
+    # 兜底：候选快照的任何数值字段非有限都不能提交（快照必须可严格 JSON 编码，
+    # 绝不给作业留下读不出来的快照）。失供总量的聚合溢出已在上面提前拦截，
+    # 这里再对完整候选（含求解结果）做一遍终检。
+    bad_path = _find_non_finite_path(snapshot)
+    if bad_path is not None:
+        if stage == "revise":
+            raise IsolationRuleError(
+                "修订需水量后候选快照的数值字段 "
+                f"“{bad_path}”为非有限值（NaN/Infinity/-Infinity），快照无法以"
+                "严格 JSON 编码；本次修订未生效，需水量、关闭集合、快照与版本号"
+                "全部保持原状，请用同一版本重试。")
+        if stage == "create":
+            raise IsolationRuleError(
+                f"初始状态候选快照的数值字段“{bad_path}”为非有限值"
+                "（NaN/Infinity/-Infinity），快照无法以严格 JSON 编码，"
+                "不创建停管隔离作业。")
+        raise IsolationRuleError(
+            f"切换后候选快照的数值字段“{bad_path}”为非有限值"
+            "（NaN/Infinity/-Infinity），快照无法以严格 JSON 编码；"
+            "本次操作未生效，关闭集合、需水量、快照与版本号全部保持原状。")
+
+    return snapshot
 
 
 # --------------------------------------------------------------------------- #
@@ -442,10 +517,10 @@ def revise_demands(job_id: str, payload: Any) -> tuple[dict[str, Any], list[dict
     失供节点保存新值并更新失供总量（重连后同样按新值求解）。
 
     版本不一致抛 VersionConflictError（同一版本的修订与管段切换合计最多
-    成功一次）；非法输入、欠压或不收敛时抛异常，需水量、关闭集合、版本号
-    与稳态结果全部保持原状。锁外重算与提交时版本比对的并发语义与
-    ``toggle_pipe`` 完全一致：基于旧版本算成的迟到提交收 409，绝不覆盖
-    新需水量。
+    成功一次）；非法输入、聚合溢出、候选快照含非有限数、欠压或不收敛时抛
+    异常，需水量、关闭集合、版本号与稳态结果全部保持原状。锁外重算与提交时
+    版本比对的并发语义与 ``toggle_pipe`` 完全一致：基于旧版本算成的迟到提交
+    收 409，绝不覆盖新需水量。
     """
     with _REGISTRY_LOCK:
         job = _JOBS.get(job_id)

@@ -4,7 +4,10 @@
 失供/欠压/不收敛规则、仅剩水源供水量为零、重连恢复当前需水量、版本冲突
 （含多线程并发同一版本最多成功一次）、作业执行中修订需水量（连通节点按新值
 求解、失供节点保存新值并更新失供总量、重连用新值、非法输入/欠压/不收敛
-不改变状态、修订与切换共用同一把版本乐观锁）、读取快照一致性、
+不改变状态、失供总量聚合溢出返回 422 且需水量/关闭集合/快照/版本全部保持
+原状、422 与随后 GET 均严格 JSON 可编码、失败后同版本重试、单个 1e308 等
+未溢出的大值修订仍成功且不设人为上限、修订与切换共用同一把版本乐观锁）、
+读取快照一致性、
 404/400/422 分支，以及计算期间的 HTTP 并发顺序（可暂停求解门：健康检查/
 读取/其他作业不阻塞、后来的操作先提交、迟到者 409 且旧计算不覆盖新需水量、
 失败后同版本重试）。
@@ -12,6 +15,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import threading
 import time
 
@@ -30,6 +35,12 @@ from app.main import app
 from app.solver import SolverNotConverged
 
 client = TestClient(app)
+
+
+def _strict_json_loads(text):
+    """按 JSON 标准严格解析：NaN/Infinity/-Infinity 记号一律视为失败。"""
+    return json.loads(
+        text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
 
 
 def _tree_payload():
@@ -595,6 +606,178 @@ def test_revise_source_only_component():
     job3 = _toggle(job2["job_id"], 2, "P1").json()["job"]
     assert job3["source_supply"] == pytest.approx(7.0)
     assert job3["solution"]["heads"]["A"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_revise_unserved_total_overflow_rejected_and_strict_encodable():
+    """两个失供节点都改为 1e308：失供总量溢出为 inf，422 且状态全部保持原状。
+
+    回归“版本推进后留下不可严格 JSON 编码快照”的缺陷：422 响应本身与随后
+    GET 到的旧快照都必须能用 allow_nan=False 的严格 JSON 解析；需水量、
+    关闭集合、快照、版本均不变，同一版本可改发不溢出的修订重试。
+    """
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create(p)
+    jid = job["job_id"]
+    assert _toggle(jid, 1 - 1, "P1").status_code == 200  # 关闭 S—A，A、B 全失供
+
+    big = 1e308
+    assert math.isfinite(big) and not math.isfinite(big + big)  # 单值有限、相加溢出
+
+    resp = _revise(jid, 1, [
+        {"node_id": "A", "demand": big},
+        {"node_id": "B", "demand": big},
+    ])
+    assert resp.status_code == 422
+    err = resp.json()["error"]
+    assert "溢出" in err and "非有限值" in err and "严格 JSON" in err
+    assert "失供" in err and "“A”" in err and "“B”" in err
+    assert "保持原状" in err and "同一版本" in err
+    # 422 响应自身必须是严格合法 JSON（不能用 NaN/Infinity 记号掩盖溢出）
+    _strict_json_loads(resp.text)
+
+    # 需水量、关闭集合、快照与版本全部保持原状；GET 旧快照同样严格可编码
+    got = _get(jid)
+    assert got["version"] == 1
+    assert got["closed_pipes"] == ["P1"]
+    assert got["unserved_nodes"] == ["A", "B"]
+    assert got["unserved_demand"] == pytest.approx(5.0)
+    assert got["demands"] == [
+        {"node_id": "A", "demand": 2.0},
+        {"node_id": "B", "demand": 3.0},
+    ]
+    assert got["source_supply"] == pytest.approx(0.0)
+    raw_get = client.get(f"/api/isolation-jobs/{jid}")
+    _strict_json_loads(raw_get.text)
+
+
+def test_revise_overflow_does_not_consume_version_single_huge_value_then_ok():
+    """溢出失败不消耗版本：单个 1e308 这类未溢出修订仍成功，绝不设人为上限。"""
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create(p)
+    jid = job["job_id"]
+    _toggle(jid, 0, "P1")  # A、B 全失供（连通区仅剩水源）
+
+    # 溢出修订失败，版本仍是 1
+    resp = _revise(jid, 1, [
+        {"node_id": "A", "demand": 1e308},
+        {"node_id": "B", "demand": 1e308},
+    ])
+    assert resp.status_code == 422
+    _strict_json_loads(resp.text)
+    assert _get(jid)["version"] == 1
+
+    # 同一版本改发“单个 1e308”（未溢出）：成功，版本 1 -> 2，失供总量即 1e308
+    resp = _revise(jid, 1, [{"node_id": "A", "demand": 1e308}])
+    assert resp.status_code == 200, resp.text
+    _strict_json_loads(resp.text)
+    job2 = resp.json()["job"]
+    assert set(resp.json()) == {"ok", "revised_demands", "job"}
+    assert job2["version"] == 2
+    assert job2["closed_pipes"] == ["P1"]
+    assert job2["source_only"] is True
+    assert job2["unserved_nodes"] == ["A", "B"]
+    assert job2["unserved_demand"] == pytest.approx(1e308)
+    assert job2["demands"][0]["demand"] == pytest.approx(1e308)
+    assert job2["demands"][1]["demand"] == 3.0
+    assert job2["source_supply"] == pytest.approx(0.0)
+    assert _get(jid) == job2
+
+    # A 已为 1e308 后，再把 B 改为 1e308 使聚合溢出：仍 422、不推进版本
+    resp = _revise(jid, 2, [{"node_id": "B", "demand": 1e308}])
+    assert resp.status_code == 422
+    _strict_json_loads(resp.text)
+    assert "溢出" in resp.json()["error"]
+    assert _get(jid)["version"] == 2
+    # 同版本重试一个不溢出的小值修订仍成功，版本 2 -> 3
+    resp = _revise(jid, 2, [{"node_id": "B", "demand": 4.0}])
+    assert resp.status_code == 200
+    assert resp.json()["job"]["version"] == 3
+    assert resp.json()["job"]["unserved_demand"] == pytest.approx(1e308 + 4.0)
+    assert client.get(f"/api/isolation-jobs/{jid}").json()["job"]["version"] == 3
+
+
+def test_revise_overflow_failure_then_reconnect_still_works():
+    """溢出失败后同版本恢复正常：改回小值、重连、供水量与水头回到正常解。"""
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create(p)
+    jid = job["job_id"]
+    _toggle(jid, 0, "P1")  # A、B 全失供
+
+    assert _revise(jid, 1, [
+        {"node_id": "A", "demand": 1e308},
+        {"node_id": "B", "demand": 1e308},
+    ]).status_code == 422
+    # 同版本把需水量改回正常值成功
+    resp = _revise(jid, 1, [
+        {"node_id": "A", "demand": 2.0},
+        {"node_id": "B", "demand": 3.0},
+    ])
+    assert resp.status_code == 200
+    assert resp.json()["job"]["version"] == 2
+    # 重开 P1：按 A=2、B=3 求解，供水量 5、H_A=25、H_B=16
+    resp = _toggle(jid, 2, "P1")
+    assert resp.status_code == 200
+    job3 = resp.json()["job"]
+    assert job3["version"] == 3
+    assert job3["closed_pipes"] == [] and job3["unserved_nodes"] == []
+    assert job3["source_supply"] == pytest.approx(5.0)
+    assert job3["solution"]["heads"] == {"S": 50.0, "A": 25.0, "B": 16.0}
+    _strict_json_loads(client.get(f"/api/isolation-jobs/{jid}").text)
+
+
+def test_revise_candidate_snapshot_non_finite_backstop(monkeypatch):
+    """候选快照（求解结果侧）含非有限值：终检拦截至 422，状态全部保持原状。
+
+    聚合溢出之外的另一道防线：即便非有限值经由求解结果混入候选快照（这里用
+    monkeypatch 人为制造 heads.A=Infinity），也不能提交成读不出来的快照。
+    """
+    job = _create(_tree_payload())  # 全连通，修订会真正调用求解器
+    jid = job["job_id"]
+    real_solve = iso.solve_network
+
+    # monkeypatch 在创建完成后才装上：修订触发的重算是被装后的第 1 次求解
+    def poisoned(net):
+        result = real_solve(net)
+        result = dict(result)
+        result["heads"] = dict(result["heads"])
+        result["heads"]["A"] = float("inf")
+        return result
+
+    monkeypatch.setattr(iso, "solve_network", poisoned)
+    resp = _revise(jid, 0, [{"node_id": "A", "demand": 3.0}])
+    assert resp.status_code == 422
+    err = resp.json()["error"]
+    assert "非有限值" in err and "solution.heads.A" in err
+    assert "严格 JSON" in err and "保持原状" in err
+    _strict_json_loads(resp.text)
+    got = _get(jid)
+    assert got["version"] == 0
+    assert got["demands"] == [
+        {"node_id": "A", "demand": 2.0},
+        {"node_id": "B", "demand": 3.0},
+    ]
+    assert got["source_supply"] == pytest.approx(5.0)
+    # 不消耗版本：同版本合法修订仍可成功
+    monkeypatch.setattr(iso, "solve_network", real_solve)
+    resp = _revise(jid, 0, [{"node_id": "A", "demand": 3.0}])
+    assert resp.status_code == 200
+    assert resp.json()["job"]["version"] == 1
+
+
+def test_find_non_finite_path_reports_first_bad_field():
+    """候选快照非有限值定位：报出首个坏字段路径，普通数值/布尔/字符串不影响。"""
+    assert iso._find_non_finite_path({"a": 1.0, "b": [{"c": 2.0}]}) is None
+    assert iso._find_non_finite_path(
+        {"a": 1.0, "b": [{"c": float("inf")}]}) == "b[0].c"
+    assert iso._find_non_finite_path(
+        {"x": float("nan"), "y": float("-inf")}) == "x"
+    assert iso._find_non_finite_path([1.0, 2.0, float("-inf")]) == "[2]"
+    # 布尔、整数、字符串不会被误判
+    assert iso._find_non_finite_path(
+        {"flag": True, "n": 3, "s": "ok", "f": 0.0}) is None
 
 
 def test_revise_zero_demand_accepted():
