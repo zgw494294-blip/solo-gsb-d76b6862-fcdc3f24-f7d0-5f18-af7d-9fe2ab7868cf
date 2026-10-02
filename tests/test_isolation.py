@@ -4,10 +4,11 @@
 失供/欠压/不收敛规则、仅剩水源供水量为零、重连恢复当前需水量、版本冲突
 （含多线程并发同一版本最多成功一次）、作业执行中修订需水量（连通节点按新值
 求解、失供节点保存新值并更新失供总量、重连用新值、非法输入/欠压/不收敛
-不改变状态、修订与切换共用同一把版本乐观锁）、读取快照一致性、
-404/400/422 分支，以及计算期间的 HTTP 并发顺序（可暂停求解门：健康检查/
-读取/其他作业不阻塞、后来的操作先提交、迟到者 409 且旧计算不覆盖新需水量、
-失败后同版本重试）。
+不改变状态、失供总量聚合溢出/候选快照含非有限数在提交前 422 拦截且
+四项状态保持原状、同版本可重试、未溢出的巨大有限值照常成功、修订与切换
+共用同一把版本乐观锁）、读取快照一致性、404/400/422 分支，以及计算期间
+的 HTTP 并发顺序（可暂停求解门：健康检查/读取/其他作业不阻塞、后来的操作
+先提交、迟到者 409 且旧计算不覆盖新需水量、失败后同版本重试）。
 """
 
 from __future__ import annotations
@@ -595,6 +596,137 @@ def test_revise_source_only_component():
     job3 = _toggle(job2["job_id"], 2, "P1").json()["job"]
     assert job3["source_supply"] == pytest.approx(7.0)
     assert job3["solution"]["heads"]["A"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_revise_overflow_unserved_total_rejected_unchanged_and_retryable():
+    """失供总量聚合溢出为 inf：422 且需水量/关闭集合/快照/版本全部保持原状。
+
+    复现场景：S(50)─P1─A(需2)─P2─B(需3)，最低水头 0、允许 A/B 失供；
+    关闭 P1 后在版本 1 把 A、B 各改为 1e308（各自有限，和 2e308 超出
+    double 上限变为 inf）。候选快照不可严格 JSON 编码，必须在提交前拦截，
+    GET 仍返回旧版本快照，同一版本可改提有限值重试成功。
+    """
+    import json
+
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create(p)
+    jid = job["job_id"]
+    assert _toggle(jid, 0, "P1").status_code == 200  # A、B 全失供，v0 -> v1
+
+    resp = _revise(jid, 1, [
+        {"node_id": "A", "demand": 1e308},
+        {"node_id": "B", "demand": 1e308},
+    ])
+    assert resp.status_code == 422
+    # 错误响应自身也必须是严格 JSON（不允许 NaN/Infinity 记号）
+    json.dumps(resp.json(), allow_nan=False)
+    err = resp.json()["error"]
+    assert "溢出" in err and "严格 JSON" in err and "保持原状" in err
+
+    # 需水量、关闭集合、快照、版本均保持版本 1 的旧状态
+    got = _get(jid)
+    assert got["version"] == 1
+    assert got["closed_pipes"] == ["P1"] and got["open_pipes"] == ["P2"]
+    assert got["unserved_nodes"] == ["A", "B"]
+    assert got["unserved_demand"] == pytest.approx(5.0)
+    assert got["demands"] == [
+        {"node_id": "A", "demand": 2.0},
+        {"node_id": "B", "demand": 3.0},
+    ]
+    assert got["source_only"] is True
+    assert got["source_supply"] == pytest.approx(0.0)
+    json.dumps(got, allow_nan=False)  # 旧快照严格可编码，作业没有变成“不可返回”
+
+    # 失败不消耗版本：同一版本改提不会溢出的有限修订即成功，v1 -> v2
+    resp = _revise(jid, 1, [
+        {"node_id": "A", "demand": 4.0},
+        {"node_id": "B", "demand": 1.0},
+    ])
+    assert resp.status_code == 200
+    job2 = resp.json()["job"]
+    assert job2["version"] == 2
+    assert job2["closed_pipes"] == ["P1"]  # 关闭集合不变
+    assert job2["unserved_demand"] == pytest.approx(5.0)
+    assert job2["demands"] == [
+        {"node_id": "A", "demand": 4.0},
+        {"node_id": "B", "demand": 1.0},
+    ]
+    json.dumps(job2, allow_nan=False)
+    assert _get(jid) == job2
+
+    # 409 版本冲突行为不变：旧版本 1 的再修订被拒
+    stale = _revise(jid, 1, [{"node_id": "A", "demand": 2.0}])
+    assert stale.status_code == 409
+    assert stale.json()["current_version"] == 2
+
+
+def test_revise_single_huge_finite_value_still_accepted_without_clamping():
+    """未溢出的巨大有限修订（单个 1e308）必须照常成功，不得用上限/字符串/截断掩盖。"""
+    import json
+
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create(p)
+    jid = job["job_id"]
+    assert _toggle(jid, 0, "P1").status_code == 200  # A、B 全失供
+
+    # 只改 A 为 1e308：失供总量 1e308+3 在 double 中仍为有限的 1e308，必须成功
+    resp = _revise(jid, 1, [{"node_id": "A", "demand": 1e308}])
+    assert resp.status_code == 200
+    job2 = resp.json()["job"]
+    assert job2["version"] == 2
+    assert job2["demands"] == [
+        {"node_id": "A", "demand": 1e308},
+        {"node_id": "B", "demand": 3.0},  # 未列出的节点保持原值
+    ]
+    assert job2["unserved_demand"] == 1e308  # 原值透传，没有任何上限钳制
+    json.dumps(job2, allow_nan=False)
+
+    # 再把 B 改为 0：失供总量仍是有限的 1e308，依旧成功
+    resp = _revise(jid, 2, [{"node_id": "B", "demand": 0.0}])
+    assert resp.status_code == 200
+    job3 = resp.json()["job"]
+    assert job3["version"] == 3 and job3["unserved_demand"] == 1e308
+    json.dumps(job3, allow_nan=False)
+
+    # 在此基础上再把 B 提到 1e308：和变为 2e308 溢出，仍按 422 拦截且状态不变
+    resp = _revise(jid, 3, [{"node_id": "B", "demand": 1e308}])
+    assert resp.status_code == 422
+    assert "溢出" in resp.json()["error"]
+    got = _get(jid)
+    assert got["version"] == 3
+    assert got["demands"] == [
+        {"node_id": "A", "demand": 1e308},
+        {"node_id": "B", "demand": 0.0},
+    ]
+    assert got["unserved_demand"] == 1e308
+
+
+def test_reject_non_finite_candidate_covers_any_snapshot_field():
+    """候选快照任意字段（含求解结果深处）出现 NaN/无穷大都在提交前被拦截。"""
+    import math
+
+    from app.isolation import (
+        IsolationRuleError,
+        _first_non_finite,
+        _reject_non_finite_candidate,
+    )
+
+    finite = {"a": 1.0, "b": [{"c": 2}], "d": "x", "e": True, "f": 3}
+    assert _first_non_finite(finite) is None
+    assert _first_non_finite({"unserved_demand": math.inf}) == "snapshot.unserved_demand"
+    path = _first_non_finite({"solution": {"heads": {"A": math.nan}}})
+    assert path == "snapshot.solution.heads.A"
+
+    with pytest.raises(IsolationRuleError) as exc:
+        _reject_non_finite_candidate({"unserved_demand": math.inf})
+    assert "溢出" in str(exc.value) and "保持原状" in str(exc.value)
+    with pytest.raises(IsolationRuleError) as exc:
+        _reject_non_finite_candidate({"solution": {"heads": {"A": -math.inf}}})
+    assert "snapshot.solution.heads.A" in str(exc.value)
+    # 全部有限时不抛异常
+    _reject_non_finite_candidate({"unserved_demand": 5.0, "solution": {"x": 1e308}})
 
 
 def test_revise_zero_demand_accepted():

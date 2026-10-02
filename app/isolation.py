@@ -18,8 +18,11 @@
 
 只有全部规则满足且稳态求解收敛时才一次性提交：切换提交关闭集合、修订提交
 需水量，二者都提交完整快照并把版本号 +1；非法操作、不收敛或规则不满足时
-全部保持原状并说明原因。版本号即乐观锁：同一版本的修订与管段切换合计最多
-成功一次；读取始终返回某一版本的完整快照，绝不混合不同版本的数据。
+全部保持原状并说明原因。修订还会在提交前核对候选快照可按严格 JSON 编码
+（不允许 NaN/Infinity）：失供总量等聚合溢出或候选快照含任何非有限数时
+同样拒绝提交、说明原因且不推进版本——绝不让作业留下无法返回的快照。
+版本号即乐观锁：同一版本的修订与管段切换合计最多成功一次；读取始终返回
+某一版本的完整快照，绝不混合不同版本的数据。
 
 耗时的连通区重算与稳态求解在作业锁之外进行，因此计算期间健康检查、已提交
 快照的读取以及其他作业的操作都不会被阻塞；同一作业也允许后来的切换先算完
@@ -36,6 +39,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from collections import deque
@@ -337,6 +341,51 @@ def _build_snapshot(job_id: str, version: int, net: Network,
     }
 
 
+def _first_non_finite(value: Any, path: str = "snapshot") -> str | None:
+    """深度遍历候选快照，返回首个非有限浮点数的字段路径；全部有限则返回 None。
+
+    只认 Python 浮点（bool 是 int 的子类，不算浮点）。聚合字段（如
+    ``unserved_demand``）由多个有限数求和得到，本身可能溢出为 inf；求解器
+    结果中的浮点理论上也可能非有限。任何非有限值都意味着该快照无法按
+    严格 JSON（不允许 NaN/Infinity）编码，必须在提交前拦截。
+    """
+    if isinstance(value, float):
+        return None if math.isfinite(value) else path
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _first_non_finite(item, f"{path}.{key}")
+            if found is not None:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for k, item in enumerate(value):
+            found = _first_non_finite(item, f"{path}[{k}]")
+            if found is not None:
+                return found
+    return None
+
+
+def _reject_non_finite_candidate(candidate: dict[str, Any]) -> None:
+    """提交前核对候选快照可严格 JSON 编码：含非有限数则按规则失败、全部保持原状。
+
+    典型成因是失供总量聚合溢出：多个各自有限的失供需水量之和超过 double
+    上限变为 inf。此时既不能用任意上限、字符串、null 或截断来掩盖溢出，
+    也不能把不可返回的快照提交进作业，故抛 IsolationRuleError（由调用方
+    在提交前处理，需水量、关闭集合、快照与版本均不改变，同一版本可重试）。
+    """
+    bad_path = _first_non_finite(candidate)
+    if bad_path is None:
+        return
+    if bad_path == "snapshot.unserved_demand":
+        raise IsolationRuleError(
+            "修订需水量后失供节点的需水量之和溢出为非有限值（超过 double 上限），"
+            "快照无法按严格 JSON 编码；本次操作未生效，需水量、关闭集合、版本与"
+            "稳态结果全部保持原状，请用同一版本改提不会溢出的需水量后重试。")
+    raise IsolationRuleError(
+        f"修订需水量后候选快照字段 {bad_path} 含非有限数值（NaN 或无穷大），"
+        "快照无法按严格 JSON 编码；本次操作未生效，需水量、关闭集合、版本与"
+        "稳态结果全部保持原状，请用同一版本修订后重试。")
+
+
 # --------------------------------------------------------------------------- #
 # 作业生命周期：创建 / 读取 / 切换 / 修订需水量
 # --------------------------------------------------------------------------- #
@@ -443,9 +492,11 @@ def revise_demands(job_id: str, payload: Any) -> tuple[dict[str, Any], list[dict
 
     版本不一致抛 VersionConflictError（同一版本的修订与管段切换合计最多
     成功一次）；非法输入、欠压或不收敛时抛异常，需水量、关闭集合、版本号
-    与稳态结果全部保持原状。锁外重算与提交时版本比对的并发语义与
-    ``toggle_pipe`` 完全一致：基于旧版本算成的迟到提交收 409，绝不覆盖
-    新需水量。
+    与稳态结果全部保持原状。失供总量等聚合溢出、或候选快照含任何非有限数
+    （无法按严格 JSON 编码）时同样在提交前抛 IsolationRuleError：不掩盖
+    溢出、不提交不可返回的快照，四项状态全部保持原状，同一版本可改提合法
+    修订重试。锁外重算与提交时版本比对的并发语义与 ``toggle_pipe`` 完全
+    一致：基于旧版本算成的迟到提交收 409，绝不覆盖新需水量。
     """
     with _REGISTRY_LOCK:
         job = _JOBS.get(job_id)
@@ -476,6 +527,9 @@ def revise_demands(job_id: str, payload: Any) -> tuple[dict[str, Any], list[dict
     # 锁外重算：失供节点保存新值、连通节点按新值求解，均由 _build_snapshot 完成
     candidate = _build_snapshot(job.job_id, base_version + 1, new_net,
                                 allowed, base_closed, stage="revise")
+    # 提交前拦截含非有限数（典型为失供总量聚合溢出为 inf）的候选快照：
+    # 不可返回的快照绝不提交，需水量、关闭集合、版本与旧快照全部保持原状
+    _reject_non_finite_candidate(candidate)
 
     # 第 2 段临界区：提交时重新比对版本——计算期间版本若已推进则丢弃本次结果
     with job.lock:
